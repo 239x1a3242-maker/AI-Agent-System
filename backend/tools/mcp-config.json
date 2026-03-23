@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "unified-bridge-server": {
+      "command": "python",
+      "args": [
+        "backend/tools/server.py"
+      ],
+      "cwd": ".",
+      "env": {
+        "FASTMCP_TRANSPORT": "stdio",
+        "BRIDGE_ALLOWED_DIRECTORIES": "workspace",
+        "MCP_SHELL_DEFAULT_CWD": "workspace",
+        "MCP_SHELL_ALLOWED_DIRECTORIES": "workspace",
+        "MCP_SHELL_TIMEOUT_SECONDS": "60",
+        "MCP_SHELL_MAX_TIMEOUT_SECONDS": "300",
+        "MCP_SHELL_MAX_COMMAND_LENGTH": "8192"
+      }
+    }
+  }
+}

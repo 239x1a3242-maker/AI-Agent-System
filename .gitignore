@@ -1,0 +1,9 @@
+.env
+.env.local
+.env.*.local
+backend/tools/send-email/.env
+.venv/
+node_modules/
+dist/
+.wrangler/
+/workspace/
