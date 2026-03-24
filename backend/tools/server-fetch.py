@@ -52,6 +52,11 @@ try:
 except Exception:
     markdownify_html = None
 
+try:
+    from tavily import TavilyClient
+except Exception:
+    TavilyClient = None
+
 
 # ---------------------------------------------------------------------------
 # Constants and configuration (mirrors src/types.ts defaults)
@@ -922,6 +927,43 @@ def ddgs_web_search(
     return normalized
 
 
+def tavily_web_search(
+    query: str,
+    max_results: int,
+) -> List[Dict[str, Any]]:
+    """Search the web using Tavily and return results in the standard schema."""
+    if TavilyClient is None:
+        raise Exception('tavily_web_search requires "tavily-python" package to be installed')
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        raise Exception("TAVILY_API_KEY environment variable is not set")
+
+    client = TavilyClient(api_key=api_key)
+    response = client.search(query=query, max_results=max_results)
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, result in enumerate(response.get("results", []), start=1):
+        normalized.append({
+            "position": idx,
+            "title": result.get("title", "No title"),
+            "url": result.get("url", ""),
+            "snippet": result.get("content", ""),
+            "source": "Tavily",
+        })
+    return normalized
+
+
+def _get_search_provider() -> str:
+    """Determine which search provider to use based on environment variables."""
+    provider = os.environ.get("SEARCH_PROVIDER", "").strip().lower()
+    if provider in ("tavily", "duckduckgo"):
+        return provider
+    # Auto-detect: prefer Tavily when API key is available
+    if os.environ.get("TAVILY_API_KEY"):
+        return "tavily"
+    return "duckduckgo"
+
+
 # ---------------------------------------------------------------------------
 # YouTube transcript extraction layer
 # ---------------------------------------------------------------------------
@@ -1233,16 +1275,24 @@ class Fetcher:
     @staticmethod
     def web_search(request_payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            results = ddgs_web_search(
-                query=request_payload["query"],
-                max_results=request_payload["max_results"],
-                region=request_payload.get("region"),
-                safesearch=request_payload.get("safesearch", "moderate"),
-                workers=request_payload.get("workers", DEFAULT_WORKERS),
-            )
+            provider = _get_search_provider()
+            if provider == "tavily":
+                results = tavily_web_search(
+                    query=request_payload["query"],
+                    max_results=request_payload["max_results"],
+                )
+            else:
+                results = ddgs_web_search(
+                    query=request_payload["query"],
+                    max_results=request_payload["max_results"],
+                    region=request_payload.get("region"),
+                    safesearch=request_payload.get("safesearch", "moderate"),
+                    workers=request_payload.get("workers", DEFAULT_WORKERS),
+                )
             payload = {
                 "query": request_payload["query"],
                 "max_results": request_payload["max_results"],
+                "provider": provider,
                 "workers_used": request_payload.get("workers", DEFAULT_WORKERS),
                 "count": len(results),
                 "results": results,
