@@ -1,6 +1,8 @@
 .env
 .env.local
 .env.*.local
+__pycache__/
+*.pyc
 backend/tools/send-email/.env
 .venv/
 node_modules/
