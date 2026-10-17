@@ -207,6 +207,53 @@ app/
 - Extra MCP tools can be loaded from `.vscode/mcp.json` if you add that file locally.
 - The repo does not require `.vscode/mcp.json` to boot; it is an optional extension point.
 
+### Optional Parallel Search MCP
+
+Enable [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+for free web search and page extraction without an account or API key. Search
+uses Fast mode for anonymous requests. The bundled `parallel-search` entry in
+`backend/tools/mcp-config.json` is disabled by default; set its `disabled` value
+to `false` to enable it. DuckDuckGo's `web_search`, local page-fetching tools,
+and workspace permissions remain available as before.
+
+If you already use `.vscode/mcp.json`, that file takes precedence over the bundled
+config. Add this entry to its existing `mcpServers` (or `servers`) object instead:
+
+```json
+{
+  "mcpServers": {
+    "parallel-search": {
+      "type": "http",
+      "url": "https://search.parallel.ai/mcp",
+      "disabled": false,
+      "timeout": 30
+    }
+  }
+}
+```
+
+The backend discovers the server's schemas and exposes
+`parallel-search_web_search` and `parallel-search_web_fetch` to the agent. All HTTP
+MCP tools use a server-name prefix, keeping the existing tool names intact. Ask
+the agent to use these tools for current information or to read a page. Results,
+including source URLs, return through the normal chat tool-result flow.
+
+HTTP entries accept optional string-valued `headers` and a positive `timeout` in
+seconds (default: 30). Saved headers, including explicit authorization, are used
+only for that server. Anonymous Parallel access needs no headers; it has usage
+limits, and service errors are returned to the agent. Failed HTTP calls are not
+automatically replayed or sent to DuckDuckGo. Set `disabled` to `true` or remove
+the entry to stop using the remote server; the next runtime refresh applies the
+change. Only enable remote servers you intend to share tool queries with.
+
+To run the focused MCP checks without installing optional memory/model packages:
+
+```sh
+python -m venv .venv
+.venv/bin/python -m pip install -r tests/requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+```
+
 ## File Processing Support
 
 Supported upload extensions:

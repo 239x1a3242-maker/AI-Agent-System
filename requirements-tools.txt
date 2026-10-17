@@ -1,0 +1,4 @@
+# Standalone tool runtime, including Streamable HTTP MCP clients.
+mcp==1.26.0
+httpx==0.28.1
+pydantic==2.11.0
