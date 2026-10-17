@@ -64,6 +64,7 @@ class _HTTPSession:
         self._queue = asyncio.Queue()
         self._pending: set[asyncio.Future] = set()
         self._error = "HTTP MCP connection is closed"
+        self._closing = False
         self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
@@ -89,7 +90,7 @@ class _HTTPSession:
                     try:
                         result = await operation
                     except asyncio.CancelledError:
-                        if not future.cancelled() or asyncio.current_task().cancelling():
+                        if not future.cancelled() or self._closing:
                             raise
                     except Exception as exc:
                         if not future.done():
@@ -124,6 +125,7 @@ class _HTTPSession:
         return await self._request("call_tool", name, arguments)
 
     async def close(self) -> None:
+        self._closing = True
         self._task.cancel()
         await self._task
 

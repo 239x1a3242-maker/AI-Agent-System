@@ -206,6 +206,29 @@ class HTTPMCPTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await bridge.shutdown()
 
+    async def test_shutdown_with_cancelled_http_request_finishes(self):
+        wire = MCPWire()
+        bridge = mcp_bridge.MCPToolBridge()
+        with tempfile.TemporaryDirectory() as directory:
+            bridge._config_candidates = [self.config(directory, {"parallel-search": self.remote()})]
+            with patch.object(mcp_bridge.httpx, "AsyncClient", side_effect=wire.client):
+                try:
+                    await bridge.ensure_started()
+                    session = bridge._bindings[REMOTE_SEARCH].session
+                    wire.failure = "slow"
+                    task = asyncio.create_task(bridge.call_tool(REMOTE_SEARCH, {
+                        "objective": "asyncio", "search_queries": ["Python asyncio documentation"]}))
+                    await asyncio.wait_for(wire.called.wait(), 1)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    # The HTTP owner can close even if request cancellation and
+                    # shutdown overlap. Its SDK scopes stay in their owner task.
+                    await asyncio.wait_for(session.close(), 1)
+                    self.assertTrue(session._task.done())
+                finally:
+                    await bridge.shutdown()
+
     async def test_invalid_or_disabled_remote_never_sends_requests(self):
         bridge = mcp_bridge.MCPToolBridge()
         cases = {
