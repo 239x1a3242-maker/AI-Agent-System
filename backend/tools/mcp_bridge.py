@@ -1,19 +1,25 @@
-"""MCP client bridge for local stdio servers."""
+"""MCP client bridge for local stdio and remote Streamable HTTP servers."""
 
 from __future__ import annotations
 
 import contextlib
+import asyncio
 import json
 import logging
+import math
 import sys
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 try:
     import mcp.types as mcp_types
+    import httpx
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.client.streamable_http import streamable_http_client
 
     MCP_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -26,6 +32,8 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 DEFAULT_BRIDGE_SERVER_NAME = "unified-bridge-server"
+PROJECT_USER_AGENT = "ai-agent-system/1.0.0 (+https://github.com/239x1a3242-maker/AI-Agent-System)"
+DEFAULT_HTTP_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -40,10 +48,90 @@ class MCPToolBinding:
     session: Any
     proxy_tool_name: str | None = None
     backend: str | None = None
+    transport: str = "stdio"
+
+
+class _HTTPSession:
+    """Own SDK task groups in one task, isolating remote transport failures.
+
+    Requests can arrive from different chat tasks. The owner serializes them and
+    propagates cancellation without leaking SDK cancel scopes into those tasks.
+    """
+
+    def __init__(self, connect, config: dict[str, Any]) -> None:
+        self._connect = connect
+        self._config = config
+        self._queue = asyncio.Queue()
+        self._pending: set[asyncio.Future] = set()
+        self._error = "HTTP MCP connection is closed"
+        self._closing = False
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                read, write, timeout = await self._connect(stack, self._config)
+                session = await stack.enter_async_context(ClientSession(
+                    read, write, read_timeout_seconds=timeout,
+                    client_info=mcp_types.Implementation(name="ai-agent-system", version="1.0.0"),
+                ))
+                await session.initialize()
+                while True:
+                    method, arguments, future = await self._queue.get()
+                    if future.cancelled():
+                        continue
+                    operation = asyncio.create_task(getattr(session, method)(*arguments))
+                    # Bind this operation, since the next request may already be
+                    # active when a completed future's callback is scheduled.
+                    def cancel_operation(done, operation=operation):
+                        if done.cancelled():
+                            operation.cancel()
+                    future.add_done_callback(cancel_operation)
+                    try:
+                        result = await operation
+                    except asyncio.CancelledError:
+                        if not future.cancelled() or self._closing:
+                            raise
+                    except Exception as exc:
+                        if not future.done():
+                            future.set_exception(exc)
+                    else:
+                        if not future.done():
+                            future.set_result(result)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._error = f"HTTP MCP connection failed: {exc!r}"
+        finally:
+            for future in self._pending:
+                if not future.done():
+                    future.set_exception(RuntimeError(self._error))
+
+    async def _request(self, method: str, *arguments):
+        if self._task.done():
+            raise RuntimeError(self._error)
+        future = asyncio.get_running_loop().create_future()
+        self._pending.add(future)
+        self._queue.put_nowait((method, arguments, future))
+        try:
+            return await future
+        finally:
+            self._pending.discard(future)
+
+    async def list_tools(self):
+        return await self._request("list_tools")
+
+    async def call_tool(self, name, arguments):
+        return await self._request("call_tool", name, arguments)
+
+    async def close(self) -> None:
+        self._closing = True
+        self._task.cancel()
+        await self._task
 
 
 class MCPToolBridge:
-    """Manage stdio MCP server sessions and expose their tools."""
+    """Manage MCP server sessions and expose their tools."""
 
     def __init__(self) -> None:
         self._app_root = Path(__file__).resolve().parents[2]
@@ -63,8 +151,6 @@ class MCPToolBridge:
 
     def _get_lock(self):
         if self._init_lock is None:
-            import asyncio
-
             self._init_lock = asyncio.Lock()
         return self._init_lock
 
@@ -270,9 +356,10 @@ class MCPToolBridge:
         tools: list[Any],
         bindings: dict[str, MCPToolBinding],
         used_names: set[str],
+        transport: str = "stdio",
     ) -> None:
         tool_by_name = {getattr(tool, "name", ""): tool for tool in tools}
-        if {"bridge_list_tools", "bridge_request"}.issubset(tool_by_name):
+        if transport == "stdio" and {"bridge_list_tools", "bridge_request"}.issubset(tool_by_name):
             try:
                 bridge_tools = await self._load_bridge_catalog(session)
                 if bridge_tools:
@@ -294,7 +381,9 @@ class MCPToolBridge:
                 logger.warning("Failed to expand bridge tools for '%s': %s", server_name, exc)
 
         for tool in tools:
-            public_name = self._make_public_name(str(server_name), tool.name, used_names)
+            # Remote tools must not shadow the existing local/fallback tools.
+            name = f"{server_name}_{tool.name}" if transport == "http" else tool.name
+            public_name = self._make_public_name(str(server_name), name, used_names)
             used_names.add(public_name)
             bindings[public_name] = MCPToolBinding(
                 public_name=public_name,
@@ -303,7 +392,29 @@ class MCPToolBridge:
                 description=(tool.description or "").strip(),
                 input_schema=tool.inputSchema or {"type": "object", "properties": {}},
                 session=session,
+                transport=transport,
             )
+
+    async def _connect_http(self, stack: contextlib.AsyncExitStack, config: dict[str, Any]):
+        url = config.get("url")
+        if not isinstance(url, str):
+            raise ValueError("HTTP MCP server requires a URL")
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("HTTP MCP URL must use http/https without embedded credentials")
+        timeout = float(config.get("timeout", DEFAULT_HTTP_TIMEOUT_SECONDS))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("HTTP MCP timeout must be a positive number of seconds")
+        headers = config.get("headers", {})
+        if not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()):
+            raise ValueError("HTTP MCP headers must be an object of string values")
+        request_headers = httpx.Headers({"User-Agent": PROJECT_USER_AGENT})
+        request_headers.update(headers)
+        client = await stack.enter_async_context(httpx.AsyncClient(headers=request_headers, timeout=timeout))
+        read_stream, write_stream, _ = await stack.enter_async_context(
+            streamable_http_client(url, http_client=client)
+        )
+        return read_stream, write_stream, timedelta(seconds=timeout)
 
     async def ensure_started(self, reserved_names: Optional[set[str]] = None, force: bool = False) -> None:
         if reserved_names is not None:
@@ -339,32 +450,35 @@ class MCPToolBridge:
                 for server_name, server_config in servers.items():
                     if not isinstance(server_config, dict):
                         continue
-
-                    command = str(server_config.get("command", "")).strip()
-                    args = [str(value) for value in server_config.get("args", []) or []]
-                    if not command:
-                        errors[str(server_name)] = "Missing server command"
+                    if server_config.get("disabled") is True:
                         continue
 
                     try:
-                        server_params = StdioServerParameters(
-                            command=command,
-                            args=args,
-                            env=self._normalize_env(str(server_name), server_config),
-                            cwd=str(server_config.get("cwd") or self._app_root),
-                        )
-                        read_stream, write_stream = await stack.enter_async_context(stdio_client(server_params))
-                        session = await stack.enter_async_context(
-                            ClientSession(
-                                read_stream,
-                                write_stream,
-                                client_info=mcp_types.Implementation(
-                                    name="ai-agent-system",
-                                    version="1.0.0",
-                                ),
+                        transport = server_config.get("type", "stdio")
+                        if transport == "http":
+                            session = _HTTPSession(self._connect_http, server_config)
+                            stack.push_async_callback(session.close)
+                        elif transport == "stdio":
+                            command = str(server_config.get("command", "")).strip()
+                            if not command:
+                                raise ValueError("Missing server command")
+                            server_params = StdioServerParameters(
+                                command=command,
+                                args=[str(value) for value in server_config.get("args", []) or []],
+                                env=self._normalize_env(str(server_name), server_config),
+                                cwd=str(server_config.get("cwd") or self._app_root),
                             )
-                        )
-                        await session.initialize()
+                            read_stream, write_stream = await stack.enter_async_context(stdio_client(server_params))
+                            session = await stack.enter_async_context(
+                                ClientSession(
+                                    read_stream,
+                                    write_stream,
+                                    client_info=mcp_types.Implementation(name="ai-agent-system", version="1.0.0"),
+                                )
+                            )
+                            await session.initialize()
+                        else:
+                            raise ValueError("Unsupported MCP server type; use stdio or http")
                         list_result = await session.list_tools()
                         await self._register_session_tools(
                             str(server_name),
@@ -372,6 +486,7 @@ class MCPToolBridge:
                             list(list_result.tools or []),
                             bindings,
                             used_names,
+                            transport=transport,
                         )
                     except Exception as exc:
                         errors[str(server_name)] = str(exc)
@@ -457,6 +572,10 @@ class MCPToolBridge:
                 result = await binding.session.call_tool(binding.server_tool_name, arguments or {})
                 normalized = self._normalize_tool_result(result)
         except Exception as exc:
+            # Remote failures are returned to the agent without replaying the
+            # request or falling back to a different provider.
+            if binding.transport == "http":
+                raise
             logger.warning("MCP tool '%s' failed once, retrying after reconnect: %s", name, exc)
             await self.ensure_started(force=True)
             binding = self._bindings.get(name)

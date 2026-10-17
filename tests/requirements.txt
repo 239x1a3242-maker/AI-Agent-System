@@ -1,0 +1,3 @@
+-r ../requirements-tools.txt
+# Scripted ReAct caller tests import the existing inference client.
+aiohttp==3.9.1

@@ -18,6 +18,7 @@ import importlib.util
 import inspect
 import json
 import os
+import sys
 from pathlib import Path
 import traceback
 import types
@@ -51,6 +52,9 @@ def _load_module(module_name: str, filename: str) -> Any:
         raise RuntimeError(f"Failed to create import spec for: {module_path}")
 
     module = importlib.util.module_from_spec(spec)
+    # Pydantic resolves the filesystem server's generic Context annotations
+    # through its defining module while that module is being imported.
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
